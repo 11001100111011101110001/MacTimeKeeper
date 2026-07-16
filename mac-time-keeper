@@ -1,0 +1,383 @@
+#!/bin/zsh
+
+# macOS low-overhead time synchronization watchdog.
+# Installed as a root LaunchDaemon; no third-party dependencies are required.
+
+set -u
+
+readonly LABEL="com.local.mac-time-keeper"
+readonly INSTALL_PATH="/usr/local/libexec/mac-time-keeper"
+readonly PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
+readonly CONFIG_PATH="/etc/mac-time-keeper.conf"
+readonly DEFAULT_SERVER="time.apple.com"
+readonly DEFAULT_TIMEOUT="3"
+readonly DEFAULT_DNS_RECORDS="3"
+readonly DEFAULT_WARN_OFFSET_MS="20"
+
+TIME_SERVER="${DEFAULT_SERVER}"
+TIMEOUT_SECONDS="${DEFAULT_TIMEOUT}"
+DNS_RECORDS="${DEFAULT_DNS_RECORDS}"
+WARN_OFFSET_MS="${DEFAULT_WARN_OFFSET_MS}"
+ALLOW_TIME_STEP="0"
+
+print_error() {
+  print -u2 -- "mac-time-keeper: $*"
+}
+
+require_root() {
+  if (( EUID != 0 )); then
+    print_error "此操作需要管理员权限，请使用 sudo。"
+    exit 1
+  fi
+}
+
+load_config() {
+  [[ -r "${CONFIG_PATH}" ]] || return 0
+
+  local key value
+  while IFS='=' read -r key value; do
+    key="${key//[[:space:]]/}"
+    value="${value//[[:space:]]/}"
+
+    [[ -z "${key}" || "${key}" == \#* ]] && continue
+    case "${key}" in
+      TIME_SERVER) TIME_SERVER="${value}" ;;
+      TIMEOUT_SECONDS) TIMEOUT_SECONDS="${value}" ;;
+      DNS_RECORDS|DNS_SAMPLES) DNS_RECORDS="${value}" ;;
+      WARN_OFFSET_MS) WARN_OFFSET_MS="${value}" ;;
+      ALLOW_TIME_STEP) ALLOW_TIME_STEP="${value}" ;;
+    esac
+  done < "${CONFIG_PATH}"
+
+  if [[ -z "${TIME_SERVER}" || "${TIME_SERVER}" == *[^A-Za-z0-9._:-]* ]]; then
+    print_error "${CONFIG_PATH} 中的 TIME_SERVER 无效。"
+    exit 2
+  fi
+  if [[ -z "${TIMEOUT_SECONDS}" || "${TIMEOUT_SECONDS}" == *[^0-9]* || "${TIMEOUT_SECONDS}" == 0 ]]; then
+    print_error "${CONFIG_PATH} 中的 TIMEOUT_SECONDS 必须是正整数。"
+    exit 2
+  fi
+  if [[ -z "${DNS_RECORDS}" || "${DNS_RECORDS}" == *[^0-9]* || "${DNS_RECORDS}" == 0 ]]; then
+    print_error "${CONFIG_PATH} 中的 DNS_RECORDS 必须是正整数。"
+    exit 2
+  fi
+  if [[ -z "${WARN_OFFSET_MS}" || "${WARN_OFFSET_MS}" == *[^0-9]* || "${WARN_OFFSET_MS}" == 0 ]]; then
+    print_error "${CONFIG_PATH} 中的 WARN_OFFSET_MS 必须是正整数。"
+    exit 2
+  fi
+  if [[ "${ALLOW_TIME_STEP}" != 0 && "${ALLOW_TIME_STEP}" != 1 ]]; then
+    print_error "${CONFIG_PATH} 中的 ALLOW_TIME_STEP 只能是 0 或 1。"
+    exit 2
+  fi
+}
+
+compact_message() {
+  /usr/bin/tr '\n' ' ' | /usr/bin/cut -c 1-500
+}
+
+extract_measurement() {
+  /usr/bin/awk '
+    /^[[:space:]]*[+-]?[0-9]+\.[0-9]+[[:space:]]+\+\/-[[:space:]]+/ { line=$0 }
+    END {
+      sub(/^[[:space:]]+/, "", line)
+      print line
+    }
+  '
+}
+
+offset_at_least_ms() {
+  local offset_seconds="$1"
+  local threshold_ms="$2"
+
+  /usr/bin/awk -v offset="${offset_seconds}" -v threshold="${threshold_ms}" '
+    BEGIN {
+      if (offset < 0) offset = -offset
+      exit !((offset * 1000) >= threshold)
+    }
+  '
+}
+
+log_rate_limited() {
+  # A disconnected network must not create one disk log entry per minute.
+  # Rate-limit each failure class to at most one record per hour.
+  local event_class="$1"
+  shift
+  local marker="/var/run/${LABEL}.${event_class}.last-log"
+  local now last=0
+  now=$(/bin/date +%s)
+
+  if [[ -r "${marker}" ]]; then
+    read -r last < "${marker}" || last=0
+  fi
+  [[ "${last}" == *[^0-9]* ]] && last=0
+
+  if (( now - last >= 3600 )); then
+    print -r -- "${now}" >| "${marker}"
+    /usr/bin/logger -t "${LABEL}" -- "${LABEL}: $*"
+  fi
+}
+
+sync_clock() {
+  require_root
+  load_config
+
+  local -a adjust_flags
+  if [[ "${ALLOW_TIME_STEP}" == 1 ]]; then
+    adjust_flags=(-sS)
+  else
+    # -s uses adjtime for offsets below 50 ms and never steps the clock.
+    # A larger offset is reported so it can be fixed during maintenance.
+    adjust_flags=(-s)
+  fi
+
+  local output status detail measurement offset
+  output=$(/usr/bin/sntp "${adjust_flags[@]}" -n "${DNS_RECORDS}" -t "${TIMEOUT_SECONDS}" "${TIME_SERVER}" 2>&1)
+  status=$?
+
+  if (( status != 0 )); then
+    detail=$(print -r -- "${output}" | compact_message)
+    log_rate_limited "sync-failure" "校时失败（server=${TIME_SERVER}, exit=${status}）：${detail}"
+    return "${status}"
+  fi
+
+  measurement=$(print -r -- "${output}" | extract_measurement)
+  [[ -n "${measurement}" ]] || return 0
+  offset="${measurement%% *}"
+
+  if [[ "${ALLOW_TIME_STEP}" == 0 ]] && offset_at_least_ms "${offset}" 50; then
+    log_rate_limited "large-offset" \
+      "偏差 ${offset} 秒，超过平滑校正范围；为避免交易期间跳时，未强制设置。停盘后运行 ${INSTALL_PATH} bootstrap。"
+  elif offset_at_least_ms "${offset}" "${WARN_OFFSET_MS}"; then
+    log_rate_limited "offset-warning" \
+      "偏差 ${offset} 秒，达到告警阈值 ${WARN_OFFSET_MS} ms；已按当前策略处理。"
+  fi
+}
+
+bootstrap_clock() {
+  require_root
+  load_config
+
+  local output status measurement
+  output=$(/usr/bin/sntp -sS -n "${DNS_RECORDS}" -t "${TIMEOUT_SECONDS}" "${TIME_SERVER}" 2>&1)
+  status=$?
+  if (( status != 0 )); then
+    print_error "首次/维护校时失败：$(print -r -- "${output}" | compact_message)"
+    return "${status}"
+  fi
+
+  measurement=$(print -r -- "${output}" | extract_measurement)
+  print -- "强制对齐完成。${measurement:+校正前测量：${measurement}}"
+}
+
+check_clock() {
+  load_config
+
+  local output status summary
+  output=$(/usr/bin/sntp -n "${DNS_RECORDS}" -t "${TIMEOUT_SECONDS}" "${TIME_SERVER}" 2>&1)
+  status=$?
+  summary=$(print -r -- "${output}" | extract_measurement)
+
+  if (( status != 0 )) || [[ -z "${summary}" ]]; then
+    print_error "NTP 测量失败：$(print -r -- "${output}" | compact_message)"
+    return 1
+  fi
+
+  print -- "${summary}"
+}
+
+health_clock() {
+  load_config
+
+  local measurement offset
+  if ! measurement=$(check_clock); then
+    return 1
+  fi
+
+  print -- "${measurement}"
+  offset="${measurement%% *}"
+  if offset_at_least_ms "${offset}" "${WARN_OFFSET_MS}"; then
+    print_error "绝对偏差达到告警阈值 ${WARN_OFFSET_MS} ms。"
+    return 2
+  fi
+}
+
+show_status() {
+  load_config
+
+  print -- "服务："
+  if /bin/launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+    local state
+    state=$(/bin/launchctl print "system/${LABEL}" 2>/dev/null | /usr/bin/awk -F'= ' '/^[[:space:]]*state =/ { print $2; exit }')
+    print -- "  已加载（state=${state:-unknown}；定时任务在两次运行之间显示 not running 属正常现象）"
+  else
+    print -- "  未加载"
+  fi
+
+  print -- "配置："
+  print -- "  NTP 服务器：${TIME_SERVER}"
+  print -- "  运行间隔：60 秒"
+  print -- "  单次超时：${TIMEOUT_SECONDS} 秒"
+  print -- "  每轮查询记录数：${DNS_RECORDS}"
+  print -- "  偏差告警阈值：${WARN_OFFSET_MS} ms"
+  if [[ "${ALLOW_TIME_STEP}" == 1 ]]; then
+    print -- "  周期策略：允许偏差超过 50 ms 时直接跳时（交易程序需能承受）"
+  else
+    print -- "  周期策略：只平滑微调，不允许直接跳时"
+  fi
+
+  if (( EUID == 0 )); then
+    print -- "系统网络时间："
+    print -- "  $(/usr/sbin/systemsetup -getusingnetworktime 2>&1)"
+    print -- "  $(/usr/sbin/systemsetup -getnetworktimeserver 2>&1)"
+  fi
+
+  print -- "当前偏差（只测量，不修改）："
+  local measurement
+  if measurement=$(check_clock); then
+    print -- "  ${measurement}"
+    print -- "  第一项为偏差秒数；正数表示本机比服务器慢，负数表示本机快。"
+  else
+    return 1
+  fi
+}
+
+install_daemon() {
+  require_root
+
+  local source_dir source_script source_plist source_config
+  source_dir="${0:A:h}"
+  source_script="${source_dir}/mac-time-keeper"
+  source_plist="${source_dir}/${LABEL}.plist"
+  source_config="${source_dir}/mac-time-keeper.conf"
+
+  if [[ ! -f "${source_script}" || ! -f "${source_plist}" || ! -f "${source_config}" ]]; then
+    print_error "安装文件不完整；请在项目目录中运行 sudo ./mac-time-keeper install。"
+    exit 1
+  fi
+  if ! /usr/bin/plutil -lint "${source_plist}" >/dev/null; then
+    print_error "LaunchDaemon plist 格式无效，安装已停止。"
+    exit 1
+  fi
+
+  if ! /usr/bin/install -d -o root -g wheel -m 755 /usr/local/libexec \
+    || ! /usr/bin/install -o root -g wheel -m 755 "${source_script}" "${INSTALL_PATH}" \
+    || ! /usr/bin/install -o root -g wheel -m 644 "${source_plist}" "${PLIST_PATH}"; then
+    print_error "无法复制安装文件。"
+    exit 1
+  fi
+  if [[ ! -e "${CONFIG_PATH}" ]]; then
+    if ! /usr/bin/install -o root -g wheel -m 644 "${source_config}" "${CONFIG_PATH}"; then
+      print_error "无法安装配置文件。"
+      exit 1
+    fi
+  fi
+
+  load_config
+
+  if [[ ! -x /usr/bin/sntp ]]; then
+    print_error "未找到 /usr/bin/sntp；本工具要求 macOS 11 或更高版本。"
+    exit 1
+  fi
+
+  print -- "正在检查 NTP 连通性（不会修改时间）……"
+  if ! check_clock; then
+    print_error "安装已停止，LaunchDaemon 尚未加载。请确认 DNS 和 UDP 123 可用后重试。"
+    exit 1
+  fi
+
+  # Keep Apple's timed enabled as the base synchronization layer and replace
+  # its endpoint with the same source used by this watchdog.
+  if ! /usr/sbin/systemsetup -setusingnetworktime on >/dev/null; then
+    print_error "无法启用 macOS 自动网络时间。"
+    exit 1
+  fi
+  if ! /usr/sbin/systemsetup -setnetworktimeserver "${TIME_SERVER}" >/dev/null; then
+    print_error "无法设置 macOS 网络时间服务器。"
+    exit 1
+  fi
+
+  print -- "正在执行一次首次对齐；此步骤可能直接调整系统时钟……"
+  if ! bootstrap_clock; then
+    print_error "首次对齐失败，LaunchDaemon 尚未加载。"
+    exit 1
+  fi
+
+  /bin/launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
+  /bin/launchctl enable "system/${LABEL}" || true
+  if ! /bin/launchctl bootstrap system "${PLIST_PATH}"; then
+    print_error "LaunchDaemon 加载失败。"
+    exit 1
+  fi
+
+  print -- "安装完成。此后每 60 秒检查并按配置策略校准。"
+  print -- "检查状态：sudo ${INSTALL_PATH} status"
+}
+
+reload_daemon() {
+  require_root
+  load_config
+
+  print -- "正在检查新 NTP 配置（不会修改时间）……"
+  check_clock || return 1
+
+  if ! /usr/sbin/systemsetup -setusingnetworktime on >/dev/null; then
+    print_error "无法启用 macOS 自动网络时间。"
+    return 1
+  fi
+  if ! /usr/sbin/systemsetup -setnetworktimeserver "${TIME_SERVER}" >/dev/null; then
+    print_error "无法设置 macOS 网络时间服务器。"
+    return 1
+  fi
+  if ! /bin/launchctl kickstart -k "system/${LABEL}"; then
+    print_error "无法重新启动 ${LABEL}；请先确认服务已安装。"
+    return 1
+  fi
+
+  print -- "配置已重载。周期任务仍按 ALLOW_TIME_STEP=${ALLOW_TIME_STEP} 运行。"
+}
+
+uninstall_daemon() {
+  require_root
+
+  /bin/launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
+  /bin/rm -f "${PLIST_PATH}" "${INSTALL_PATH}"
+
+  print -- "已卸载 ${LABEL}。"
+  print -- "保留了 ${CONFIG_PATH}，以免丢失自定义配置。"
+}
+
+show_logs() {
+  /usr/bin/log show --last 1h --style compact \
+    --predicate "eventMessage CONTAINS '${LABEL}'" 2>/dev/null
+}
+
+usage() {
+  print -- "用法："
+  print -- "  sudo ./mac-time-keeper install    安装并启动"
+  print -- "  mac-time-keeper status            查看服务与当前偏差"
+  print -- "  mac-time-keeper check             只测量当前偏差"
+  print -- "  mac-time-keeper health            检查偏差，达到阈值时返回非零"
+  print -- "  sudo mac-time-keeper sync         按周期策略立即校时"
+  print -- "  sudo mac-time-keeper bootstrap    停盘维护时强制对齐（可能跳时）"
+  print -- "  sudo mac-time-keeper reload       修改配置后验证并重载"
+  print -- "  mac-time-keeper logs              查看最近一小时失败/偏差日志"
+  print -- "  sudo mac-time-keeper uninstall    卸载"
+}
+
+case "${1:-}" in
+  sync) sync_clock ;;
+  bootstrap) bootstrap_clock ;;
+  check) check_clock ;;
+  health) health_clock ;;
+  status) show_status ;;
+  install) install_daemon ;;
+  reload) reload_daemon ;;
+  uninstall) uninstall_daemon ;;
+  logs) show_logs ;;
+  -h|--help|help|'') usage ;;
+  *)
+    print_error "未知命令：${1}"
+    usage
+    exit 64
+    ;;
+esac
