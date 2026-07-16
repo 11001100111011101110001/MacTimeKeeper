@@ -130,14 +130,14 @@ sync_clock() {
     adjust_flags=(-s)
   fi
 
-  local output status detail measurement offset
+  local output exit_code detail measurement offset
   output=$(/usr/bin/sntp "${adjust_flags[@]}" -n "${DNS_RECORDS}" -t "${TIMEOUT_SECONDS}" "${TIME_SERVER}" 2>&1)
-  status=$?
+  exit_code=$?
 
-  if (( status != 0 )); then
+  if (( exit_code != 0 )); then
     detail=$(print -r -- "${output}" | compact_message)
-    log_rate_limited "sync-failure" "校时失败（server=${TIME_SERVER}, exit=${status}）：${detail}"
-    return "${status}"
+    log_rate_limited "sync-failure" "校时失败（server=${TIME_SERVER}, exit=${exit_code}）：${detail}"
+    return "${exit_code}"
   fi
 
   measurement=$(print -r -- "${output}" | extract_measurement)
@@ -157,12 +157,12 @@ bootstrap_clock() {
   require_root
   load_config
 
-  local output status measurement
+  local output exit_code measurement
   output=$(/usr/bin/sntp -sS -n "${DNS_RECORDS}" -t "${TIMEOUT_SECONDS}" "${TIME_SERVER}" 2>&1)
-  status=$?
-  if (( status != 0 )); then
+  exit_code=$?
+  if (( exit_code != 0 )); then
     print_error "首次/维护校时失败：$(print -r -- "${output}" | compact_message)"
-    return "${status}"
+    return "${exit_code}"
   fi
 
   measurement=$(print -r -- "${output}" | extract_measurement)
@@ -172,12 +172,12 @@ bootstrap_clock() {
 check_clock() {
   load_config
 
-  local output status summary
+  local output exit_code summary
   output=$(/usr/bin/sntp -n "${DNS_RECORDS}" -t "${TIMEOUT_SECONDS}" "${TIME_SERVER}" 2>&1)
-  status=$?
+  exit_code=$?
   summary=$(print -r -- "${output}" | extract_measurement)
 
-  if (( status != 0 )) || [[ -z "${summary}" ]]; then
+  if (( exit_code != 0 )) || [[ -z "${summary}" ]]; then
     print_error "NTP 测量失败：$(print -r -- "${output}" | compact_message)"
     return 1
   fi
